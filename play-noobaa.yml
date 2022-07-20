@@ -1,0 +1,438 @@
+---
+- name: NooBaa installation
+  hosts: NooBaa
+  become: true
+  vars:
+    - NOOBAA_CORE_IMAGE: "quay.io/noobaa/noobaa-core:master-20220422"
+    - MINIO_IMAGE: "docker.io/minio/minio:latest"
+    - POSTGRES_IMAGE: "docker.io/library/postgres:latest"
+    - POSTGRES_HOST: "{{ ansible_facts['default_ipv4']['address'] }}"
+    - POSTGRES_USER: "noobaa"
+    - POSTGRES_PASSWORD: "noobaa"
+    - POSTGRES_DBNAME: "noobaa"
+    - ADMIN_MAIL: "<your-email-address>"
+    - ADMIN_PASSWORD: "changeme"
+    - SYSTEM_NAME: "test"
+    - SYSTEM_VIRTUAL_HOSTS: "node2.example.com"
+    - SYSTEM_REGION: ""
+    - ENDPOINT_GROUP_ID: "group1"
+    - NOOBAA_JWT_SECRET: "changeme"
+    - NOOBAA_SERVER_SECRET: "changeme"
+    - NOOBAA_ROOT_SECRET: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    - NOOBAA_AUTH_TOKEN: ""
+    - FIREWALL: false
+    - MINIO_S3_ACCESS: "test"
+    - MINIO_S3_SECRET: "testS3user"
+    - AGENT_COUNT: 3
+    - AGENT_SIZE: 25
+    - AGENT_DEVICES:
+        - { name: "agent01", device: "/dev/sdb" }
+        - { name: "agent02", device: "/dev/sdc" }
+        - { name: "agent03", device: "/dev/sdd" }
+    - LOCAL_POOL: true
+
+  tasks:
+    - name: "Pull container Images"
+      containers.podman.podman_image:
+        name: "{{ item }}"
+      with_items:
+        - "{{ NOOBAA_CORE_IMAGE }}"
+        - "{{ MINIO_IMAGE }}"
+        - "{{ POSTGRES_IMAGE }}"
+
+    - name: "Configure Firewall access"
+      ansible.builtin.firewalld:
+        permanent: yes
+        immediate: yes
+        state: enabled
+        port: "{{ item }}"
+      with_items:
+        - "6001/tcp"
+        - "6444/tcp"
+        - "8080/tcp"
+        - "8443/tcp"
+        - "8444/tcp"
+        - "8445/tcp"
+        - "8446/tcp"
+        - "60100/tcp"
+        - "27017/tcp"
+        - "19000/tcp"
+        - "19001/tcp"
+        - "29000/tcp"
+        - "29001/tcp"
+      when: FIREWALL
+
+    - name: "Create container Volumes for persistent storage"
+      containers.podman.podman_volume:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - "{{ SYSTEM_NAME }}-noobaa-core-data"
+        - "{{ SYSTEM_NAME }}-noobaa-core-root"
+        - "{{ SYSTEM_NAME }}-noobaa-endpoint-data"
+        - "{{ SYSTEM_NAME }}-noobaa-endpoint-root"
+        - "{{ SYSTEM_NAME }}-postgresql"
+        - "{{ SYSTEM_NAME }}-minio1"
+        - "{{ SYSTEM_NAME }}-minio2"
+
+    - name: "create Postgresql"
+      containers.podman.podman_container:
+        name: "{{ SYSTEM_NAME }}-postgresql"
+        image: "{{ POSTGRES_IMAGE }}"
+        state: started
+        volumes:
+          - "{{ SYSTEM_NAME }}-postgresql:/var/lib/postgresql/data/"
+        publish:
+          - "5432:5432"
+        env:
+          POSTGRES_DB: "{{ POSTGRES_DBNAME }}"
+          POSTGRES_USER: "{{ POSTGRES_USER }}"
+          POSTGRES_PASSWORD: "{{ POSTGRES_PASSWORD }}"
+    
+    - name: "create MinIO instances"
+      containers.podman.podman_container:
+        name: "{{ SYSTEM_NAME }}-{{ item.name }}"
+        image: "{{ MINIO_IMAGE }}"
+        command: "server /data --console-address :9001"
+        state: started
+        volumes:
+          - "{{ SYSTEM_NAME }}-{{ item.name }}:/data"
+        publish:
+          - "{{ item.port }}:9000"
+          - "{{ item.port_adm }}:9001"
+      loop:
+        - { name: "minio1", port: "19000", port_adm: "19001" } 
+        - { name: "minio2", port: "29000", port_adm: "29001" } 
+
+    - name: "create NooBaa core"
+      containers.podman.podman_container:
+        name: "{{ SYSTEM_NAME }}-noobaa-core"
+        image: "{{ NOOBAA_CORE_IMAGE }}"
+        state: started
+        volumes:
+          - "{{ SYSTEM_NAME }}-noobaa-core-data:/data"
+          - "{{ SYSTEM_NAME }}-noobaa-core-root:/root"
+        privileged: true
+        publish:
+          - "8080:8080"
+          - "8443:8443"
+          - "8444:8444"
+          - "8445:8445"
+          - "8446:8446"
+          - "60100:60100"
+        env:
+          DB_TYPE: "postgres"
+          POSTGRES_HOST: "{{ POSTGRES_HOST }}"
+          POSTGRES_USER: "{{ POSTGRES_USER }}"
+          POSTGRES_PASSWORD: "{{ POSTGRES_PASSWORD }}"
+          POSTGRES_DBNAME: "{{ POSTGRES_DBNAME }}"
+          JWT_SECRET: "{{ NOOBAA_JWT_SECRET }}"
+          SERVER_SECRET: "{{ NOOBAA_SERVER_SECRET }}"
+          NOOBAA_ROOT_SECRET: "{{ NOOBAA_ROOT_SECRET }}"
+          AGENT_PROFILE: "{ \"image\": \"${NOOBAA_CORE_IMAGE}\" }"
+          DISABLE_DEV_RANDOM_SEED: "true"
+          ENDPOINT_FORKS_NUMBER: "1"
+
+    - name: "sleep to get NooBaa starting"
+      ansible.builtin.command:
+        cmd: "sleep 3"
+
+    - name: "configure NooBaa core system"
+      tags:
+        - configure
+      ansible.builtin.uri:
+        url: "http://{{ ansible_facts['default_ipv4']['address'] }}:8080/rpc"
+        body: |
+           {"api": "system_api",
+            "method": "create_system",
+            "params": {
+               "name": "{{ SYSTEM_NAME }}",
+               "email": "{{ ADMIN_MAIL }}",
+               "password": "{{ ADMIN_PASSWORD }}"
+               }
+           }
+        body_format: "json"
+        status_code: 200
+        return_content: yes
+      until: APIKEY.status == 200
+      retries: 10
+      delay: 5
+      register: APIKEY
+
+    - name: "API Key for System {{ SYSTEM_NAME }}"
+      tags:
+        - configure
+      ansible.builtin.debug:
+        var: APIKEY
+
+    - name: "save API token"
+      ansible.builtin.set_fact:
+        NOOBAA_AUTH_TOKEN: "{{ APIKEY.content | from_json | json_query('reply.token') }}"
+
+    - name: "API Key for System {{ SYSTEM_NAME }}"
+      ansible.builtin.debug:
+        msg: "Token: {{ NOOBAA_AUTH_TOKEN }}"
+
+    - name: "Store API key in file"
+      ansible.builtin.copy:
+        content: "{{ NOOBAA_AUTH_TOKEN }}"
+        dest: '/root/noobaa-auth-token'
+        mode: '0444'
+        owner: 'root'
+        group: 'root'
+
+    - name: "configure NooBaa endpoint system"
+      tags:
+        - endpoint
+      containers.podman.podman_container:
+        name: "{{SYSTEM_NAME }}-noobaa-endpoint"
+        image: "{{ NOOBAA_CORE_IMAGE }}"
+        state: started
+        command: "/noobaa_init_files/noobaa_init.sh init_endpoint"
+        volumes:
+          - "{{ SYSTEM_NAME }}-noobaa-endpoint-data:/data"
+          - "{{ SYSTEM_NAME }}-noobaa-endpoint-root:/root"
+        privileged: true
+        publish:
+          - "6001:6001"
+          - "6444:6443"
+        env:
+          MGMT_ADDR: "wss://{{ ansible_facts['default_ipv4']['address'] }}:8443"
+          MD_ADDR: "wss://{{ ansible_facts['default_ipv4']['address'] }}:8444"
+          BG_ADDR: "wss://{{ ansible_facts['default_ipv4']['address'] }}:8445"
+          HOSTED_AGENTS_ADDR: "wss://{{ ansible_facts['default_ipv4']['address'] }}:8446"
+          DB_TYPE: "postgres"
+          POSTGRES_HOST: "{{ POSTGRES_HOST }}"
+          POSTGRES_USER: "{{ POSTGRES_USER }}"
+          POSTGRES_PASSWORD: "{{ POSTGRES_PASSWORD }}"
+          POSTGRES_DBNAME: "{{ POSTGRES_DBNAME }}"
+          VIRTUAL_HOSTS: "{{ SYSTEM_VIRTUAL_HOSTS }}"
+          REGION: "{{ SYSTEM_REGION }}"
+          ENDPOINT_GROUP_ID: "{{ ENDPOINT_GROUP_ID }}"
+          JWT_SECRET: "{{ NOOBAA_JWT_SECRET }}"
+          LOCAL_MD_SERVER: "true"
+          LOCAL_N2N_AGENT: "true"
+          SERVER_SECRET: "{{ NOOBAA_SERVER_SECRET }}"
+          NOOBAA_ROOT_SECRET: "{{ NOOBAA_ROOT_SECRET }}"
+          NOOBAA_DISABLE_COMPRESSION: "false"
+          NOOBAA_AUTH_TOKEN: "{{ NOOBAA_AUTH_TOKEN }}"
+          AGENT_PROFILE: "{ \"image\": \"${NOOBAA_CORE_IMAGE}\" }"
+          DISABLE_DEV_RANDOM_SEED: "true"
+          ENDPOINT_FORKS_NUMBER: "1"
+
+    - name: "get S3 credentials"
+      tags:
+        - s3
+      ansible.builtin.uri:
+        url: "http://{{ ansible_facts['default_ipv4']['address'] }}:8080/rpc"
+        body: |
+           {"api": "account_api",
+            "method": "read_account",
+            "params": {
+                "email": "{{ ADMIN_MAIL }}",
+               },
+            "auth_token": "{{ NOOBAA_AUTH_TOKEN }}"
+           }
+        body_format: "json"
+        status_code: 200
+        return_content: yes
+      until: S3CREDS.status == 200
+      retries: 10
+      delay: 5
+      register: S3CREDS
+
+    - name: "save S3 access credentials"
+      tags:
+        - s3
+      ansible.builtin.set_fact:
+        AWS_ACCESS_KEY: "{{ (S3CREDS.content | from_json | json_query('reply.access_keys'))[0].access_key }}"
+
+    - name: "save S3 secret credentials"
+      tags:
+        - s3
+      ansible.builtin.set_fact:
+        AWS_SECRET_KEY: "{{ (S3CREDS.content | from_json | json_query('reply.access_keys'))[0].secret_key }}"
+
+    - name: "debug S3 credentials"
+      tags:
+        - s3
+      ansible.builtin.debug:
+        msg: "access={{ AWS_ACCESS_KEY }} secret={{ AWS_SECRET_KEY }}"
+
+    - name: "get mcli for configuration of MinIO" 
+      ansible.builtin.get_url:
+        url: https://dl.min.io/client/mc/release/linux-amd64/mc
+        dest: /usr/bin/mcli
+        mode: 0755
+
+    - name: "configure mcli aliases"
+      tags:
+        - s3
+      ansible.builtin.command: "mcli alias set {{ item.name }} {{ item.uri }} {{ item.access }} {{ item.secret }}"
+      loop:
+        - { name: "minio1", uri: "http://{{ ansible_facts['default_ipv4']['address'] }}:19000", 
+            access: "minioadmin", secret: "minioadmin" }
+        - { name: "minio2", uri: "http://{{ ansible_facts['default_ipv4']['address'] }}:29000", 
+            access: "minioadmin", secret: "minioadmin" }
+        - { name: "noobaa", uri: "http://{{ ansible_facts['default_ipv4']['address'] }}:6001",
+            access: "{{ AWS_ACCESS_KEY }}", secret: "{{ AWS_SECRET_KEY }}" }
+
+
+    - name: "configure MinIO Buckets"
+      tags:
+        - s3
+      ansible.builtin.command: "mcli mb {{ item.name }}/{{ item.bucket }}"
+      loop:
+        - { name: "minio1", bucket: "bucket01" }
+        - { name: "minio1", bucket: "bucket02" }
+        - { name: "minio1", bucket: "bucket03" }
+        - { name: "minio1", bucket: "nsbucket01" }
+        - { name: "minio1", bucket: "nsbucket02" }
+        - { name: "minio1", bucket: "nsbucket03" }
+        - { name: "minio2", bucket: "bucket01" }
+        - { name: "minio2", bucket: "bucket02" }
+        - { name: "minio2", bucket: "bucket03" }
+        - { name: "minio2", bucket: "nsbucket01" }
+        - { name: "minio2", bucket: "nsbucket02" }
+        - { name: "minio2", bucket: "nsbucket03" }
+
+    - name: "configure MinIO S3 user access"
+      tags:
+        - s3
+      ansible.builtin.command: "mcli admin user add {{ item }} {{ MINIO_S3_ACCESS }} {{ MINIO_S3_SECRET }}"
+      with_items:
+        - "minio1"
+        - "minio2"
+
+    - name: "grant users access to MinIO"
+      tags:
+        - s3
+      ansible.builtin.command: "mcli admin policy set {{ item }} readwrite user={{ MINIO_S3_ACCESS }}"
+      with_items:
+        - "minio1"
+        - "minio2"
+
+    - name: "create Pool in NooBaa"
+      tags:
+        - pool
+      ansible.builtin.uri:
+        url: "http://{{ ansible_facts['default_ipv4']['address'] }}:8080/rpc"
+        body: |
+           {"api": "pool_api",
+            "method": "create_hosts_pool",
+            "params": {
+                "name": "pool0",
+                "is_managed": false,
+                "host_count": {{ AGENT_COUNT }},
+                "host_config": {
+                  "volume_size": {{ AGENT_SIZE * (1024 ** 3)|int }}
+                }
+            },
+            "auth_token": "{{ NOOBAA_AUTH_TOKEN }}"
+           }
+        body_format: "json"
+        status_code: 200
+        return_content: yes
+      when: LOCAL_POOL
+
+    - name: "get Agent Config" 
+      ansible.builtin.uri:
+        url: "http://{{ ansible_facts['default_ipv4']['address'] }}:8080/rpc"
+        body: |
+           {"api": "pool_api",
+            "method": "get_hosts_pool_agent_config",
+            "params": {
+                "name": "pool0",
+            },
+            "auth_token": "{{ NOOBAA_AUTH_TOKEN }}"
+           }
+        body_format: "json"
+        status_code: 200
+        return_content: yes
+      register: AGENT_CONFIG_RSP
+      when: LOCAL_POOL
+
+    - name: "set Agent config" 
+      ansible.builtin.set_fact: 
+        AGENT_CONFIG: "{{ AGENT_CONFIG_RSP.content | from_json | json_query('reply') }}"
+      when: LOCAL_POOL
+
+    - name: "set Agent config decoded"
+      ansible.builtin.set_fact: 
+        AGENT_CONFIG_DECODED: "{{ AGENT_CONFIG | b64decode }}"
+      when: LOCAL_POOL
+
+    - name: "create NooBaa Agent file systems"
+      ansible.builtin.filesystem:
+        fstype: xfs
+        dev: "{{ item.device }}"
+      with_items: "{{ AGENT_DEVICES }}"
+      when: LOCAL_POOL
+
+    - name: "create Storage volumes for podman volumes"
+      ansible.builtin.file:
+        path: "/var/lib/containers/storage/volumes/{{ item.name }}"
+        state: directory
+        mode: '0755'
+        setype: container_var_lib_t
+      with_items: "{{ AGENT_DEVICES }}"
+      when: LOCAL_POOL
+
+    - name: "mount podman volumes"
+      ansible.builtin.mount:
+        path: "/var/lib/containers/storage/volumes/{{ item.name }}"
+        src: "{{ item.device }}"
+        fstype: "xfs"
+        state: mounted
+      with_items: "{{ AGENT_DEVICES }}"
+      when: LOCAL_POOL
+
+    - name: "create podman volumes"
+      containers.podman.podman_volume:
+        name: "{{ item.name }}"
+        state: present
+      with_items: "{{ AGENT_DEVICES }}"
+      when: LOCAL_POOL
+
+    - name: "deploy agent_conf.json"
+      ansible.builtin.copy:
+        content: "{{ AGENT_CONFIG_DECODED }}"
+        dest: "/var/lib/containers/storage/volumes/{{ item.name }}/_data/agent_conf.json"
+      with_items: "{{ AGENT_DEVICES }}"
+      when: LOCAL_POOL
+
+    - name: "create NooBaa Agents"
+      containers.podman.podman_container:
+        name: "{{ SYSTEM_NAME }}-noobaa-{{ item.name }}"
+        image: "{{ NOOBAA_CORE_IMAGE }}"
+        state: started
+        command: "/noobaa_init_files/noobaa_init.sh agent"
+        hostname: "{{ item.name }}"
+        volumes:
+          - "{{ item.name }}:/noobaa_storage/"
+        env:
+          AGENT_CONFIG: "{{ AGENT_CONFIG }}"
+          MGMT_ADDR: "wss://{{ ansible_facts['default_ipv4']['address'] }}:8443"
+          MD_ADDR: "wss://{{ ansible_facts['default_ipv4']['address'] }}:8444"
+          BG_ADDR: "wss://{{ ansible_facts['default_ipv4']['address'] }}:8445"
+          HOSTED_AGENTS_ADDR: "wss://{{ ansible_facts['default_ipv4']['address'] }}:8446"
+          VIRTUAL_HOST: "{{ SYSTEM_VIRTUAL_HOSTS }}"
+          REGION: "{{ SYSTEM_REGION }}"
+          ENDPOINT_GROUP_ID: "{{ ENDPOINT_GROUP_ID }}"
+          JWT_SECRET: "{{ NOOBAA_JWT_SECRET }}"
+          LOCAL_MD_SERVER: "true"
+          LOCAL_N2N_AGENT: "true"
+          SERVER_SECRET: "{{ NOOBAA_SERVER_SECRET }}"
+          NOOBAA_ROOT_SECRET: "{{ NOOBAA_ROOT_SECRET }}"
+          NOOBAA_DISABLE_COMPRESSION: "false"
+          NOOBAA_AUTH_TOKEN: "{{ NOOBAA_AUTH_TOKEN }}"
+          AGENT_PROFILE: "{ \"image\": \"${NOOBAA_CORE_IMAGE}\" }"
+          DISABLE_DEV_RANDOM_SEED: "true"
+          ENDPOINT_FORKS_NUMBER: "1"
+          DB_TYPE: "postgres"
+          POSTGRES_HOST: "{{ POSTGRES_HOST }}"
+          POSTGRES_USER: "{{ POSTGRES_USER }}"
+          POSTGRES_PASSWORD: "{{ POSTGRES_PASSWORD }}"
+          POSTGRES_DBNAME: "{{ POSTGRES_DBNAME }}"
+      with_items: "{{ AGENT_DEVICES }}"
+      when: LOCAL_POOL
